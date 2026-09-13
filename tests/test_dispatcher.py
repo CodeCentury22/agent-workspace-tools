@@ -7,7 +7,22 @@ def test_schema_merge():
     assert "read_file" in names
     assert "run_shell_command" in names
     assert "replace_in_file" in names
+    assert "insert_lines" in names
+    assert "regex_replace_in_file" in names
+    assert "apply_patch" in names
+    assert "get_file_digest" in names
     assert "start_background_task" in names
+    assert "list_background_tasks" in names
+    assert "cancel_background_task" in names
+
+
+def test_schema_names_match_dispatcher_keys():
+    """Every advertised tool must have a callable dispatcher entry."""
+    from agent_workspace_tools import WORKSPACE_TOOL_DISPATCHER
+    for tool in WORKSPACE_TOOLS_SCHEMA:
+        name = tool["function"]["name"]
+        assert name in WORKSPACE_TOOL_DISPATCHER
+        assert callable(WORKSPACE_TOOL_DISPATCHER[name])
 
 @pytest.mark.asyncio
 async def test_unified_dispatcher(tmp_path):

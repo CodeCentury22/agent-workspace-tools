@@ -7,13 +7,21 @@ from agent_workspace_tools.async_runner import (
     execute_async_subprocess,
     start_background_task,
     get_background_task_status,
+    list_background_tasks,
+    cancel_background_task,
     clean_success_stderr,
     filter_errors_only,
     extract_error_files,
     enrich_build_error,
     summarize_success_output
 )
-from agent_workspace_tools.git_utils import get_git_status_changes
+from agent_workspace_tools.git_utils import (
+    get_git_status_changes,
+    get_git_branch,
+    get_recent_git_commits,
+    get_git_diff,
+    get_git_summary,
+)
 
 def test_is_high_risk_detection():
     assert is_high_risk("rm -rf /tmp/test") is True
@@ -189,3 +197,124 @@ def test_clean_success_stderr():
     cleaned = clean_success_stderr(verbose_success_stderr)
     assert "Exceeds maximum budget" not in cleaned
     assert "Some benign info message" in cleaned
+
+# =====================================================================
+# Background task introspection & cancellation
+# =====================================================================
+
+@pytest.mark.asyncio
+async def test_list_background_tasks_and_cancel():
+    proc_start = await start_background_task("sleep 30")
+    assert proc_start["status"] == "STARTED"
+    task_id = proc_start["task_id"]
+
+    listing = await list_background_tasks()
+    assert listing["status"] == "SUCCESS"
+    assert any(t["task_id"] == task_id and t["status"] == "RUNNING" for t in listing["tasks"])
+
+    cancel_res = await cancel_background_task(task_id)
+    assert cancel_res["status"] == "CANCELLED"
+
+    status_res = await get_background_task_status(task_id)
+    assert status_res["status"] == "CANCELLED"
+    assert status_res["returncode"] != 0
+
+
+@pytest.mark.asyncio
+async def test_cancel_background_task_not_found_and_finished():
+    res = await cancel_background_task("task_does_not_exist")
+    assert res["status"] == "NOT_FOUND"
+
+    done = await start_background_task("echo quick")
+    task_id = done["task_id"]
+    await asyncio.sleep(0.1)
+    res = await cancel_background_task(task_id)
+    assert res["status"] == "ALREADY_FINISHED"
+
+
+@pytest.mark.asyncio
+async def test_execute_async_subprocess_supports_cwd(tmp_path):
+    (tmp_path / "marker.txt").write_text("cwd works")
+    result = await execute_async_subprocess("ls marker.txt", timeout=10.0, cwd=str(tmp_path))
+    assert result["status"] == "SUCCESS"
+    assert "marker.txt" in result["stdout"]
+
+
+@pytest.mark.asyncio
+async def test_execute_async_subprocess_invalid_cwd(tmp_path):
+    result = await execute_async_subprocess("echo hi", timeout=10.0, cwd=str(tmp_path / "nope"))
+    assert result["status"] == "ERROR"
+    assert "Working directory" in result["stderr"]
+
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.async_runner.request_human_approval", return_value=False)
+async def test_start_background_task_hitl_denied(mock_hitl):
+    result = await start_background_task("rm -rf /dummy/path")
+    assert result["status"] == "DENIED"
+    mock_hitl.assert_called_once()
+
+# =====================================================================
+# Git context tooling
+# =====================================================================
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.git_utils.execute_async_subprocess", new_callable=AsyncMock)
+async def test_get_git_branch(mock_exec):
+    mock_exec.return_value = {"returncode": 0, "stdout": "feature/agent-tools\n", "stderr": ""}
+    branch = await get_git_branch("/fake/dir")
+    assert branch == "feature/agent-tools"
+
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.git_utils.execute_async_subprocess", new_callable=AsyncMock)
+async def test_get_recent_git_commits(mock_exec):
+    mock_exec.return_value = {
+        "returncode": 0,
+        "stdout": "abc123 feat: add apply_patch\nbcd234 fix: guard cwd\n",
+        "stderr": "",
+    }
+    commits = await get_recent_git_commits("/fake/dir", count=2)
+    assert len(commits) == 2
+    assert commits[0] == {"hash": "abc123", "message": "feat: add apply_patch"}
+
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.git_utils.execute_async_subprocess", new_callable=AsyncMock)
+async def test_get_git_diff_and_not_a_repo(mock_exec):
+    mock_exec.return_value = {"returncode": 0, "stdout": " src/app.ts | 2 +-\n", "stderr": ""}
+    diff = await get_git_diff("/fake/dir")
+    assert "src/app.ts" in diff
+
+    mock_exec.return_value = {"returncode": 128, "stdout": "", "stderr": "fatal: not a git repository"}
+    assert await get_git_diff("/fake/dir") == ""
+
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.git_utils.get_git_status_changes", new_callable=AsyncMock)
+@patch("agent_workspace_tools.git_utils.get_git_branch", new_callable=AsyncMock)
+@patch("agent_workspace_tools.git_utils.get_recent_git_commits", new_callable=AsyncMock)
+@patch("agent_workspace_tools.git_utils.get_git_diff", new_callable=AsyncMock)
+async def test_get_git_summary(mock_diff, mock_commits, mock_branch, mock_status):
+    mock_status.return_value = (True, {"src/app.ts"}, {"src/old.ts"})
+    mock_branch.return_value = "main"
+    mock_commits.return_value = [{"hash": "abc123", "message": "chore: init"}]
+    mock_diff.return_value = " src/app.ts | 2 +-"
+
+    summary = await get_git_summary("/fake/dir")
+    assert summary["is_git_repo"] is True
+    assert summary["branch"] == "main"
+    assert summary["uncommitted_modified"] == ["src/app.ts"]
+    assert summary["uncommitted_deleted"] == ["src/old.ts"]
+    assert summary["diff_stat"] == " src/app.ts | 2 +-"
+
+
+@pytest.mark.asyncio
+@patch("agent_workspace_tools.git_utils.get_git_status_changes", new_callable=AsyncMock)
+async def test_get_git_summary_non_git(mock_status):
+    mock_status.return_value = (False, set(), set())
+    summary = await get_git_summary("/fake/dir")
+    assert summary["is_git_repo"] is False
+    assert summary["branch"] == ""
+    assert summary["recent_commits"] == []
+    assert summary["diff_stat"] == ""

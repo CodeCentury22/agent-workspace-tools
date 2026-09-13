@@ -4,8 +4,9 @@ import os
 import re
 import shlex
 import uuid
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional, Tuple
 from agent_core_utils import track_latency, audit_logger
+from .utils import normalize_path
 
 HIGHRISKCOMMANDS = {"rm", "rmdir", "chmod", "chown", "sudo", "dd", "mkfs"}
 
@@ -30,6 +31,31 @@ BLOCKED_DAEMONS = [
 ]
 
 BACKGROUND_TASKS: Dict[str, Dict[str, Any]] = {}
+
+# Upper bound for retained background task records; oldest finished tasks are evicted first.
+MAX_BACKGROUND_TASKS: int = int(os.environ.get("AGENT_MAX_BACKGROUND_TASKS", "50"))
+
+
+def _evict_stale_background_tasks() -> None:
+    """Drops the oldest finished task records when the store exceeds MAX_BACKGROUND_TASKS."""
+    while len(BACKGROUND_TASKS) > MAX_BACKGROUND_TASKS:
+        oldest_done = next(
+            (tid for tid, info in BACKGROUND_TASKS.items() if info.get("returncode") is not None),
+            None,
+        )
+        if oldest_done is None:
+            return
+        BACKGROUND_TASKS.pop(oldest_done)
+
+
+def _resolve_cwd(cwd: Optional[str]) -> Optional[str]:
+    """Normalizes a requested working directory, enforcing the workspace sandbox when enabled."""
+    if cwd is None:
+        return None
+    normalized = normalize_path(cwd)
+    if not os.path.isdir(normalized):
+        raise FileNotFoundError(f"Working directory '{cwd}' does not exist or is not a directory.")
+    return normalized
 
 
 def has_active_mcp_config(workspace_dir: str = ".") -> bool:
@@ -168,6 +194,7 @@ def summarize_success_output(stdout: str) -> str:
 async def execute_async_subprocess(
     command: str,
     timeout: float = 30.0,
+    cwd: Optional[str] = None,
     bypass_hitl: bool = False
 ) -> Dict[str, Any]:
     is_blocked, sanitized_cmd, block_reason = intercept_and_sanitize_command(command)
@@ -179,10 +206,16 @@ async def execute_async_subprocess(
             return {"command": sanitized_cmd, "stdout": "", "stderr": "Execution denied by human operator", "returncode": -1, "status": "DENIED"}
 
     try:
+        working_dir = _resolve_cwd(cwd)
+    except Exception as e:
+        return {"command": sanitized_cmd, "stdout": "", "stderr": str(e), "returncode": -2, "status": "ERROR"}
+
+    try:
         process = await asyncio.create_subprocess_shell(
             sanitized_cmd,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE
+            stderr=asyncio.subprocess.PIPE,
+            cwd=working_dir
         )
         stdout_bytes, stderr_bytes = await asyncio.wait_for(process.communicate(), timeout=timeout)
         raw_stdout = stdout_bytes.decode("utf-8").strip()
@@ -207,20 +240,36 @@ async def execute_async_subprocess(
         return {"command": sanitized_cmd, "stdout": "", "stderr": f"Command timed out after {timeout} seconds.", "returncode": -9, "status": "TIMEOUT"}
 
 
-async def start_background_task(command: str) -> Dict[str, Any]:
+async def start_background_task(
+    command: str,
+    cwd: Optional[str] = None,
+    bypass_hitl: bool = False
+) -> Dict[str, Any]:
     is_blocked, sanitized_cmd, block_reason = intercept_and_sanitize_command(command)
     if is_blocked:
-        return {"status": "BLOCKED", "error": f"System Guardrail Error: {block_reason}"}
+        return {"command": sanitized_cmd, "status": "BLOCKED", "error": f"System Guardrail Error: {block_reason}"}
+
+    if is_high_risk(sanitized_cmd) and not bypass_hitl:
+        if not request_human_approval(sanitized_cmd):
+            return {"command": sanitized_cmd, "status": "DENIED", "error": "Execution denied by human operator"}
+
+    try:
+        working_dir = _resolve_cwd(cwd)
+    except Exception as e:
+        return {"command": sanitized_cmd, "status": "ERROR", "error": str(e)}
 
     task_id = f"task_{uuid.uuid4().hex[:8]}"
     process = await asyncio.create_subprocess_shell(
         sanitized_cmd,
         stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        stderr=asyncio.subprocess.PIPE,
+        cwd=working_dir
     )
 
+    _evict_stale_background_tasks()
     BACKGROUND_TASKS[task_id] = {
         "command": sanitized_cmd,
+        "cwd": working_dir,
         "process": process,
         "status": "RUNNING",
         "stdout": "",
@@ -254,11 +303,49 @@ async def get_background_task_status(task_id: str) -> Dict[str, Any]:
     return {
         "task_id": task_id,
         "command": task_info["command"],
+        "cwd": task_info.get("cwd"),
         "status": task_info["status"],
         "returncode": task_info["returncode"],
         "stdout": task_info["stdout"],
         "stderr": task_info["stderr"]
     }
+
+
+async def list_background_tasks() -> Dict[str, Any]:
+    """Enumerates all tracked background tasks (running and finished) with their statuses."""
+    tasks = []
+    for tid, info in BACKGROUND_TASKS.items():
+        tasks.append({
+            "task_id": tid,
+            "command": info["command"],
+            "status": info["status"],
+            "returncode": info["returncode"],
+        })
+    tasks.sort(key=lambda t: t["task_id"])
+    return {"tasks": tasks, "count": len(tasks), "status": "SUCCESS"}
+
+
+async def cancel_background_task(task_id: str) -> Dict[str, Any]:
+    """Terminates a running background task (SIGTERM, then SIGKILL after 5s)."""
+    if task_id not in BACKGROUND_TASKS:
+        return {"status": "NOT_FOUND", "error": f"Task ID '{task_id}' not found."}
+    task_info = BACKGROUND_TASKS[task_id]
+    process = task_info["process"]
+
+    if process.returncode is not None:
+        return {"task_id": task_id, "status": "ALREADY_FINISHED", "returncode": process.returncode, "message": "Task already completed."}
+
+    try:
+        process.terminate()
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+    except asyncio.TimeoutError:
+        process.kill()
+        await process.wait()
+
+    task_info["status"] = "CANCELLED"
+    task_info["returncode"] = process.returncode
+    task_info["stderr"] = (task_info["stderr"] + "\n" if task_info["stderr"] else "") + "Task cancelled by agent."
+    return {"task_id": task_id, "status": "CANCELLED", "returncode": process.returncode, "message": "Background task terminated."}
 
 
 run_shell_command = execute_async_subprocess
@@ -273,7 +360,8 @@ SHELL_TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "The exact shell command string to execute."},
-                    "timeout": {"type": "number", "description": "Maximum execution time in seconds.", "default": 30.0}
+                    "timeout": {"type": "number", "description": "Maximum execution time in seconds.", "default": 30.0},
+                    "cwd": {"type": "string", "description": "Optional working directory to execute the command in."}
                 },
                 "required": ["command"]
             }
@@ -287,7 +375,8 @@ SHELL_TOOLS_SCHEMA: List[Dict[str, Any]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Command to run in background."}
+                    "command": {"type": "string", "description": "Command to run in background."},
+                    "cwd": {"type": "string", "description": "Optional working directory to run the task in."}
                 },
                 "required": ["command"]
             }
@@ -306,6 +395,32 @@ SHELL_TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "required": ["task_id"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_background_tasks",
+            "description": "Lists every tracked background task with its current status and return code.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": []
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_background_task",
+            "description": "Terminates a running background task (SIGTERM, escalating to SIGKILL).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_id": {"type": "string", "description": "The task_id of the background task to terminate."}
+                },
+                "required": ["task_id"]
+            }
+        }
     }
 ]
 
@@ -313,4 +428,6 @@ ASYNC_TOOL_DISPATCHER = {
     "run_shell_command": run_shell_command,
     "start_background_task": start_background_task,
     "get_background_task_status": get_background_task_status,
+    "list_background_tasks": list_background_tasks,
+    "cancel_background_task": cancel_background_task,
 }

@@ -7,6 +7,11 @@ from agent_workspace_tools.file_ops import (
     read_file,
     write_file,
     replace_in_file,
+    insert_lines,
+    append_to_file,
+    regex_replace_in_file,
+    apply_patch,
+    get_file_digest,
     delete_file,
     list_files,
     search_in_files,
@@ -21,6 +26,11 @@ EXPECTED_TOOL_NAMES = {
     "read_file",
     "write_file",
     "replace_in_file",
+    "insert_lines",
+    "append_to_file",
+    "regex_replace_in_file",
+    "apply_patch",
+    "get_file_digest",
     "delete_file",
     "list_files",
     "search_in_files",
@@ -285,3 +295,246 @@ def test_move_file(tmp_path):
     assert res["status"] == "SUCCESS"
     assert not src.exists()
     assert dst.read_text() == "moving"
+
+# ---------------------------------------------------------------------
+# insert_lines / append_to_file
+# ---------------------------------------------------------------------
+
+def test_insert_lines_mid_file(tmp_path):
+    target = tmp_path / "code.py"
+    write_file(str(target), "line1\nline2\nline3\n")
+
+    res = insert_lines(str(target), insert_line=2, new_text="inserted_a\ninserted_b")
+    assert res["status"] == "SUCCESS"
+    assert res["lines_inserted"] == 2
+    assert res["total_lines"] == 5
+
+    content = target.read_text()
+    assert content.startswith("line1\ninserted_a\ninserted_b\nline2\nline3")
+    assert content.endswith("\n")  # trailing newline preserved
+
+
+def test_insert_lines_at_boundaries_and_create(tmp_path):
+    target = tmp_path / "top.txt"
+    write_file(str(target), "a\nb\n")
+
+    res = insert_lines(str(target), insert_line=1, new_text="TOP")
+    assert res["status"] == "SUCCESS"
+    assert target.read_text().startswith("TOP\na\nb")
+
+    res = insert_lines(str(target), insert_line=4, new_text="BOTTOM")
+    assert res["status"] == "SUCCESS"
+    assert target.read_text().endswith("BOTTOM\n")
+
+    missing = tmp_path / "new.txt"
+    res = insert_lines(str(missing), insert_line=1, new_text="created")
+    assert res["status"] == "ERROR"
+    res = insert_lines(str(missing), insert_line=1, new_text="created", create_if_missing=True)
+    assert res["status"] == "SUCCESS"
+    assert missing.read_text() == "created\n"
+
+
+def test_insert_lines_out_of_bounds(tmp_path):
+    target = tmp_path / "oob.txt"
+    write_file(str(target), "only\n")
+    res = insert_lines(str(target), insert_line=5, new_text="x")
+    assert res["status"] == "ERROR"
+    assert "insert_line" in res["error"]
+
+
+def test_append_to_file_existing_and_new(tmp_path):
+    target = tmp_path / "log.txt"
+    write_file(str(target), "first")
+    res = append_to_file(str(target), "second")
+    assert res["status"] == "SUCCESS"
+    assert target.read_text() == "first\nsecond"  # ensure_newline inserted between
+
+    brand_new = tmp_path / "fresh.txt"
+    res = append_to_file(str(brand_new), "hello")
+    assert res["status"] == "SUCCESS"
+    assert res["created"] is True
+    assert brand_new.read_text() == "hello"
+
+
+def test_append_to_file_no_change(tmp_path):
+    target = tmp_path / "nochange.txt"
+    write_file(str(target), "static")
+    res = append_to_file(str(target), "")
+    assert res["status"] == "NO_CHANGE"
+
+
+# ---------------------------------------------------------------------
+# regex_replace_in_file
+# ---------------------------------------------------------------------
+
+def test_regex_replace_in_file_all_count_and_case(tmp_path):
+    target = tmp_path / "refactor.py"
+    write_file(str(target), "call(arg);\ncall(  arg  );\nCALL(arg);\n")
+
+    res = regex_replace_in_file(str(target), pattern=r"call\(\s*arg\s*\)", replace_text="invoke(arg)")
+    assert res["status"] == "SUCCESS"
+    assert res["match_count"] == 2  # case-sensitive -> leaves CALL untouched
+
+    res = regex_replace_in_file(str(target), pattern=r"call\(\s*arg\s*\)", replace_text="invoke(arg)", case_sensitive=False)
+    assert res["status"] == "SUCCESS"
+    assert res["match_count"] == 1
+    assert "CALL" not in target.read_text()
+
+    write_file(str(target), "x,y\nx,y\nx,y\n")
+    res = regex_replace_in_file(str(target), pattern=r",", replace_text=";", count=1)
+    assert res["match_count"] == 1
+    assert target.read_text() == "x;y\nx,y\nx,y\n"
+
+
+def test_regex_replace_in_file_no_match_and_invalid(tmp_path):
+    target = tmp_path / "nomatch.txt"
+    write_file(str(target), "hello world")
+
+    res = regex_replace_in_file(str(target), pattern="nope", replace_text="x")
+    assert res["status"] == "NO_MATCH"
+    assert res["match_count"] == 0
+
+    res = regex_replace_in_file(str(target), pattern="([unclosed", replace_text="x")
+    assert res["status"] == "ERROR"
+    assert "Invalid regex" in res["error"]
+
+
+# ---------------------------------------------------------------------
+# get_file_digest
+# ---------------------------------------------------------------------
+
+def test_get_file_digest_matches_get_file_info(tmp_path):
+    target = tmp_path / "digest.txt"
+    write_file(str(target), "hello agent")
+
+    digest_res = get_file_digest(str(target))
+    assert digest_res["status"] == "SUCCESS"
+    assert digest_res["algorithm"] == "sha256"
+    assert len(digest_res["digest"]) == 64
+
+    info_res = get_file_info(str(target))
+    assert info_res["sha256"] == digest_res["digest"]
+
+
+def test_get_file_digest_errors(tmp_path):
+    res = get_file_digest(str(tmp_path / "missing.txt"))
+    assert res["status"] == "ERROR"
+
+    target = tmp_path / "badalg.txt"
+    write_file(str(target), "x")
+    res = get_file_digest(str(target), algorithm="not_a_real_hash_xyz")
+    assert res["status"] == "ERROR"
+# ---------------------------------------------------------------------
+# apply_patch (unified diff application)
+# ---------------------------------------------------------------------
+
+MID_PATCH = (
+    "--- a/src/greet.py\n"
+    "+++ b/src/greet.py\n"
+    "@@ -1,5 +1,6 @@\n"
+    " def greet(name):\n"
+    "     return f\"Hello, {name}\"\n"
+    " \n"
+    "+\n"
+    " def bye():\n"
+    "     return \"Goodbye\"\n"
+)
+
+
+def test_apply_patch_updates_multiple_files(tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "greet.py").write_text("def greet(name):\n    return f\"Hello, {name}\"\n\ndef bye():\n    return \"Goodbye\"\n")
+
+    res = apply_patch(MID_PATCH, directory=str(tmp_path))
+    assert res["status"] == "SUCCESS"
+    assert res["patch_stats"]["files_updated"] == 1
+    assert res["patch_stats"]["additions"] == 1
+    updated = (tmp_path / "src" / "greet.py").read_text()
+    assert "def greet(name):\n    return f\"Hello, {name}\"\n\n\ndef bye():" in updated
+    assert updated.endswith("\n")
+
+
+def test_apply_patch_creates_new_file_and_deletes(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\nomega\n")
+
+    multi_file_patch = """diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ alpha
++beta
+ omega
+
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,2 @@
++first line
++second line
+"""
+    res = apply_patch(multi_file_patch, directory=str(tmp_path))
+    assert res["status"] == "SUCCESS"
+    assert res["patch_stats"]["files_updated"] == 1
+    assert res["patch_stats"]["files_created"] == 1
+    assert (tmp_path / "a.txt").read_text() == "alpha\nbeta\nomega\n"
+    assert (tmp_path / "new.txt").read_text() == "first line\nsecond line\n"
+
+    delete_patch = """--- a/a.txt
++++ /dev/null
+@@ -1,3 +0,0 @@
+-alpha
+-beta
+-omega
+"""
+    res = apply_patch(delete_patch, directory=str(tmp_path), allow_delete=True)
+    assert res["status"] == "SUCCESS"
+    assert res["patch_stats"]["files_deleted"] == 1
+    assert not (tmp_path / "a.txt").exists()
+
+    res = apply_patch(delete_patch, directory=str(tmp_path), allow_delete=False)
+    assert res["status"] == "DENIED"
+
+
+def test_apply_patch_atomic_failure_leaves_files_untouched(tmp_path):
+    (tmp_path / "a.txt").write_text("alpha\nomega\n")
+
+    # Second hunk context does not match b.txt (which says "wrong").
+    bad_patch = """--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ alpha
++beta
+ omega
+
+--- a/b.txt
++++ b/b.txt
+@@ -1,1 +1,1 @@
+-wrong
++fixed
+"""
+    res = apply_patch(bad_patch, directory=str(tmp_path))
+    assert res["status"] == "ERROR"
+    assert "does not apply cleanly" in res["error"]
+    # Nothing was written: a.txt must retain original content.
+    assert (tmp_path / "a.txt").read_text() == "alpha\nomega\n"
+
+
+def test_apply_patch_rejects_empty_and_malformed(tmp_path):
+    res = apply_patch("")
+    assert res["status"] == "ERROR"
+
+    res = apply_patch("some freeform text without headers")
+    assert res["status"] == "ERROR"
+
+    bad_hunk = """--- a/x.txt
++++ b/x.txt
+@@ -1,3 +1,3 @@
+ a
+-b
+ c
+"""
+    write_file(str(tmp_path / "x.txt"), "a\nb\nc\n")
+    res = apply_patch(bad_hunk, directory=str(tmp_path))
+    assert res["status"] == "ERROR"
+    assert "Malformed unified diff" in res["error"]

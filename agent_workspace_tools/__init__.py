@@ -2,9 +2,34 @@ import inspect
 from typing import Dict, Any, List
 
 from .utils import normalize_path, get_workspace_root, PathEscapeError
-from .file_ops import FILE_TOOLS_SCHEMA, FILE_TOOL_DISPATCHER
-from .async_runner import SHELL_TOOLS_SCHEMA, ASYNC_TOOL_DISPATCHER, execute_async_subprocess, start_background_task, get_background_task_status
-from .git_utils import get_git_status_changes
+from .file_ops import (
+    FILE_TOOLS_SCHEMA,
+    FILE_TOOL_DISPATCHER,
+    read_file,
+    write_file,
+    replace_in_file,
+    insert_lines,
+    append_to_file,
+    regex_replace_in_file,
+    apply_patch,
+    get_file_digest,
+)
+from .async_runner import (
+    SHELL_TOOLS_SCHEMA,
+    ASYNC_TOOL_DISPATCHER,
+    execute_async_subprocess,
+    start_background_task,
+    get_background_task_status,
+    list_background_tasks,
+    cancel_background_task,
+)
+from .git_utils import (
+    get_git_status_changes,
+    get_git_branch,
+    get_recent_git_commits,
+    get_git_diff,
+    get_git_summary,
+)
 
 # Combined tool schema injected into the LLM system prompt
 WORKSPACE_TOOLS_SCHEMA: List[Dict[str, Any]] = FILE_TOOLS_SCHEMA + SHELL_TOOLS_SCHEMA
@@ -49,5 +74,11 @@ __all__ = [
     "execute_async_subprocess",
     "start_background_task",
     "get_background_task_status",
+    "list_background_tasks",
+    "cancel_background_task",
     "get_git_status_changes",
+    "get_git_branch",
+    "get_recent_git_commits",
+    "get_git_diff",
+    "get_git_summary",
 ]
