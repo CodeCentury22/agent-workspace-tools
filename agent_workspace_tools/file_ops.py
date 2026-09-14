@@ -279,6 +279,61 @@ def write_file(
         return {"file_path": file_path, "error": str(e), "status": "ERROR"}
 
 
+def _normalize_line(line: str, level: int) -> str:
+    """Progressively looser line normalization for fuzzy matching.
+
+    level 1: strip leading/trailing whitespace (tolerates indentation drift).
+    level 2: also collapse internal whitespace runs to a single space
+              (tolerates extra/missing spaces, tabs-vs-spaces mid-line).
+    """
+    if level == 1:
+        return line.strip()
+    return re.sub(r"\s+", " ", line).strip()
+
+
+def _fuzzy_find_matches(content: str, search_text: str) -> List[Tuple[int, int]]:
+    """Locates whitespace/indentation-tolerant matches of `search_text` in `content`.
+
+    Returns a list of (start, end) character offsets into `content` for the
+    exact substrings that correspond to `search_text` once minor per-line
+    whitespace differences are ignored. Tries progressively looser
+    normalization levels and stops at the first level that yields a match.
+    Returns [] if no tolerant match is found at any level. This exists so
+    that models which reproduce a code block with slightly different
+    indentation, trailing spaces, or tab/space mixes are still healed
+    instead of tripping a hard "search_text not found" failure.
+    """
+    search_lines = search_text.splitlines()
+    if not search_lines:
+        return []
+
+    content_lines = content.splitlines(keepends=True)
+    bare_lines = [ln.rstrip("\n").rstrip("\r") for ln in content_lines]
+    window = len(search_lines)
+    if window == 0 or window > len(bare_lines):
+        return []
+
+    # Precompute character offsets for the start of each content line.
+    offsets: List[int] = []
+    cursor = 0
+    for ln in content_lines:
+        offsets.append(cursor)
+        cursor += len(ln)
+
+    for level in (1, 2):
+        target = [_normalize_line(l, level) for l in search_lines]
+        matches: List[Tuple[int, int]] = []
+        for i in range(0, len(bare_lines) - window + 1):
+            candidate = [_normalize_line(l, level) for l in bare_lines[i : i + window]]
+            if candidate == target:
+                start = offsets[i]
+                end = offsets[i + window - 1] + len(content_lines[i + window - 1])
+                matches.append((start, end))
+        if matches:
+            return matches
+    return []
+
+
 @track_latency
 @audit_logger(log_file="file_tools_telemetry.jsonl")
 def replace_in_file(
@@ -324,11 +379,34 @@ def replace_in_file(
 
         existing_content = path_obj.read_text(encoding="utf-8")
         occurrences = existing_content.count(search_text)
+        fuzzy_matched = False
 
         if occurrences == 0:
-            return {"file_path": posix_path, "error": "The specified search_text was not found in the file.", "status": "ERROR"}
-
-        if replace_all:
+            # --- Fuzzy fallback: tolerate whitespace/indentation drift ---
+            # Models frequently reproduce a code block with slightly different
+            # leading indentation, trailing spaces, or tab/space mixes. Before
+            # failing outright, retry with a whitespace-normalized line match.
+            fuzzy_spans = _fuzzy_find_matches(existing_content, search_text)
+            if not fuzzy_spans:
+                return {
+                    "file_path": posix_path,
+                    "error": (
+                        "The specified search_text was not found in the file, even after "
+                        "a whitespace/indentation-tolerant fuzzy match attempt. Re-read the "
+                        "file with read_file and copy the EXACT text block (including "
+                        "original indentation) for search_text, or use apply_patch instead."
+                    ),
+                    "status": "ERROR",
+                }
+            fuzzy_matched = True
+            occurrences = len(fuzzy_spans)
+            spans = fuzzy_spans if replace_all else fuzzy_spans[:1]
+            occurrences_replaced = len(spans)
+            new_content = existing_content
+            # Splice from the last match backwards so earlier offsets stay valid.
+            for start, end in reversed(spans):
+                new_content = new_content[:start] + replace_text + new_content[end:]
+        elif replace_all:
             new_content = existing_content.replace(search_text, replace_text)
             occurrences_replaced = occurrences
         else:
@@ -340,12 +418,19 @@ def replace_in_file(
 
         _atomic_write(path_obj, new_content)
 
-        return {
+        result: Dict[str, Any] = {
             "file_path": posix_path,
             "status": "SUCCESS",
             "message": "Text successfully replaced.",
             "occurrences_replaced": occurrences_replaced,
         }
+        if fuzzy_matched:
+            result["fuzzy_matched"] = True
+            result["message"] = (
+                "Text successfully replaced using whitespace/indentation-tolerant fuzzy "
+                "matching (exact search_text was not found verbatim)."
+            )
+        return result
     except Exception as e:
         return {"file_path": file_path, "error": str(e), "status": "ERROR"}
 
@@ -1033,13 +1118,159 @@ def _func_schema(name: str, desc: str, props: Dict[str, Any], req: List[str]) ->
 
 FILE_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     _func_schema("read_file", "Reads text content from a specified file.", {"file_path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, ["file_path"]),
-    _func_schema("write_file", "Writes content to a file, atomically. Overwrites ENTIRE file. Use replace_in_file for edits.", {"file_path": {"type": "string"}, "code_body": {"type": "string"}, "overwrite": {"type": "boolean", "default": True}}, ["file_path", "code_body"]),
-    _func_schema("replace_in_file", "Replaces an exact text block in a file with new text. ALWAYS use this instead of write_file for edits.", {"file_path": {"type": "string"}, "search_text": {"type": "string"}, "replace_text": {"type": "string"}, "replace_all": {"type": "boolean", "default": True}}, ["file_path", "search_text", "replace_text"]),
-    _func_schema("modify_file", "Alias for surgical file edits. Routes to replace_in_file when search_text (or aliases like old_string/search/content pairing) is present, else overwrites the file like write_file when only replacement content (content/body/code/code_body) is given. Prefer replace_in_file for exact edits.", {"file_path": {"type": "string"}, "search_text": {"type": "string"}, "replace_text": {"type": "string"}, "replace_all": {"type": "boolean", "default": True}}, ["file_path"]),
+    _func_schema(
+        "replace_in_file",
+        (
+            "Performs a surgical find-and-replace of an EXACT, verbatim text block inside an existing file, "
+            "leaving the rest of the file untouched. This is the PREFERRED tool for editing part of a file — "
+            "always use it instead of write_file whenever you only need to change a few lines. The value of "
+            "'search_text' must match the file's current on-disk content character-for-character, including "
+            "indentation, blank lines, and line endings; the safest way to guarantee this is to call read_file "
+            "immediately beforehand and copy the exact block you intend to replace rather than retyping it from "
+            "memory. Example call: "
+            '{"name": "replace_in_file", "arguments": {"file_path": "src/app/utils.py", '
+            '"search_text": "def add(a, b):\\n    return a + b\\n", '
+            '"replace_text": "def add(a, b):\\n    return a + b  # fixed rounding\\n", "replace_all": true}}. '
+            "Edge cases: if 'search_text' is not found verbatim, the tool automatically retries with a "
+            "whitespace/indentation-tolerant fuzzy match before giving up (the response includes "
+            "'fuzzy_matched: true' when this fallback was used) — if that also fails you get status 'ERROR' "
+            "and should re-read the file and copy the block again rather than guessing; if 'search_text' and "
+            "'replace_text' are identical the call returns status 'NO_CHANGE'; set 'replace_all' to false to "
+            "touch only the first occurrence when the same text appears multiple times. There is no "
+            "'modify_file' tool — call replace_in_file directly by name for edits."
+        ),
+        {
+            "file_path": {
+                "type": "string",
+                "description": "Path to the existing file to edit, relative to the workspace root or absolute. The file must already exist; use write_file to create new files.",
+            },
+            "search_text": {
+                "type": "string",
+                "description": (
+                    "The EXACT, verbatim block of text to find in the file, including original indentation and "
+                    "line breaks. Prefer copying this directly from a prior read_file result rather than "
+                    "retyping it, since even a single mismatched space can cause a 'not found' error (though a "
+                    "whitespace-tolerant fuzzy fallback will attempt to recover from minor indentation drift)."
+                ),
+            },
+            "replace_text": {
+                "type": "string",
+                "description": "The exact text that should replace every matched occurrence of 'search_text'. Provide an empty string to delete the matched block entirely.",
+            },
+            "replace_all": {
+                "type": "boolean",
+                "default": True,
+                "description": "When true (default), every occurrence of 'search_text' is replaced. Set to false to replace only the first occurrence.",
+            },
+        },
+        ["file_path", "search_text", "replace_text"],
+    ),
+    _func_schema(
+        "modify_file",
+        (
+            "DEPRECATED ALIAS — do not call this tool by name; it exists only so that hallucinated calls to a "
+            "generic 'modify_file' still succeed instead of tripping the circuit breaker. Internally it inspects "
+            "the arguments you provide and transparently routes to replace_in_file when a search-style key "
+            "('search_text' or aliases like 'old_string'/'search'/'find') is present, or to write_file (full "
+            "overwrite) when only replacement content ('content'/'body'/'code'/'code_body') is supplied without "
+            "any search key. Prefer calling replace_in_file (for edits) or write_file (for full overwrites) "
+            "directly by their real names, since that gives you precise control and clearer error messages "
+            "instead of relying on this best-effort routing guess."
+        ),
+        {
+            "file_path": {"type": "string", "description": "Path to the file to modify."},
+            "search_text": {"type": "string", "description": "Exact text to find; if provided, routes to replace_in_file."},
+            "replace_text": {"type": "string", "description": "Replacement text, or full file content when no search_text is given (routes to write_file)."},
+            "replace_all": {"type": "boolean", "default": True, "description": "Replace every occurrence when routed to replace_in_file."},
+        },
+        ["file_path"],
+    ),
+    _func_schema(
+        "write_file",
+        (
+            "Writes FULL content to a file, atomically (temp-file + rename, so readers never see a "
+            "partial write), completely OVERWRITING any existing file at that path or creating it if "
+            "missing (parent directories are created automatically). Use this ONLY when you intend to "
+            "replace the entire file contents — e.g. creating a brand-new file, or rewriting a file so "
+            "small that reproducing it in full is cheaper/safer than a surgical edit. For editing part "
+            "of an existing file, prefer replace_in_file or apply_patch instead, since write_file requires "
+            "you to supply every single line of the file (including lines you don't want to change) or "
+            "those lines WILL be lost. Example call: "
+            '{"name": "write_file", "arguments": {"file_path": "src/app/utils.py", '
+            '"code_body": "def add(a, b):\\n    return a + b\\n", "overwrite": true}}. '
+            "Edge cases: if the file already exists and 'overwrite' is false, the call is rejected with "
+            "status 'DENIED' instead of silently clobbering data; if 'code_body' is byte-for-byte identical "
+            "to the current file contents, the call is a no-op and returns status 'NO_CHANGE' instead of "
+            "SUCCESS. There is no 'modify_file' or 'update_file' tool — those names are aliases that route "
+            "to this tool (or to replace_in_file) automatically, but you should call write_file directly by name."
+        ),
+        {
+            "file_path": {
+                "type": "string",
+                "description": "Path to the file to write, relative to the workspace root (e.g. 'src/app/utils.py') or absolute. Parent directories are created automatically if they do not exist.",
+            },
+            "code_body": {
+                "type": "string",
+                "description": (
+                    "The COMPLETE new contents of the file, exactly as it should appear on disk after the "
+                    "write, including every import, blank line, and trailing newline you want kept. This is "
+                    "NOT a diff or a partial snippet — anything you omit will be permanently removed from the "
+                    "file. Example: \"import os\\n\\ndef main():\\n    print('hi')\\n\"."
+                ),
+            },
+            "overwrite": {
+                "type": "boolean",
+                "default": True,
+                "description": "If false and the file already exists, the write is refused (status 'DENIED') instead of replacing its contents. Defaults to true.",
+            },
+        },
+        ["file_path", "code_body"],
+    ),
     _func_schema("insert_lines", "Inserts new text at an exact 1-based line boundary without rewriting surrounding content. Use to add imports, functions, or config entries precisely.", {"file_path": {"type": "string"}, "insert_line": {"type": "integer"}, "new_text": {"type": "string"}, "create_if_missing": {"type": "boolean", "default": False}}, ["file_path", "insert_line", "new_text"]),
     _func_schema("append_to_file", "Appends content to the end of a file, creating the file when it does not exist.", {"file_path": {"type": "string"}, "content": {"type": "string"}, "ensure_newline": {"type": "boolean", "default": True}}, ["file_path", "content"]),
     _func_schema("regex_replace_in_file", "Performs a regex find-and-replace in a file. Prefer over replace_in_file for refactors where matches vary in whitespace or casing.", {"file_path": {"type": "string"}, "pattern": {"type": "string"}, "replace_text": {"type": "string"}, "count": {"type": "integer", "default": 0}, "case_sensitive": {"type": "boolean", "default": True}}, ["file_path", "pattern", "replace_text"]),
-    _func_schema("apply_patch", "Applies a git-style unified diff ('---'/'+++' headers with '@@' hunks) across one or more files atomically. Preferred for multi-file changes.", {"patch_text": {"type": "string"}, "directory": {"type": "string", "default": "."}, "allow_delete": {"type": "boolean", "default": True}}, ["patch_text"]),
+    _func_schema(
+        "apply_patch",
+        (
+            "Applies one or more git-style unified diffs across one or many files in a single ATOMIC "
+            "operation: every hunk in every file is validated against the current on-disk content first, "
+            "and only if ALL hunks apply cleanly are ANY files actually written — if even one hunk's context "
+            "does not match, nothing is changed and you get status 'ERROR'. This is the PREFERRED tool for "
+            "multi-file refactors, or when you already have a diff (e.g. from git or from your own reasoning) "
+            "since it is far less failure-prone than reproducing exact search_text blocks by hand. Each file "
+            "entry MUST start with a '--- a/<path>' and '+++ b/<path>' header pair (use '/dev/null' as the "
+            "source to create a new file, or as the destination to delete a file), followed by one or more "
+            "'@@ -old_start,old_count +new_start,new_count @@' hunk headers whose body lines begin with a "
+            "literal ' ' (context, unchanged), '-' (line removed), or '+' (line added) — do NOT omit the "
+            "leading space/-/+ marker column, since that is how the parser distinguishes context from content. "
+            "Example call: "
+            '{"name": "apply_patch", "arguments": {"patch_text": '
+            '"--- a/src/greet.py\\n+++ b/src/greet.py\\n@@ -1,3 +1,3 @@\\n def greet(name):\\n-    return name\\n+    return f\\"Hi, {name}\\"\\n", '
+            '"directory": ".", "allow_delete": true}}. '
+            "Edge cases: creating a new file uses '--- /dev/null' / '+++ b/<path>' with an '@@ -0,0 +1,N @@' "
+            "hunk containing only '+' lines; deleting a file uses '--- a/<path>' / '+++ /dev/null' with all "
+            "'-' lines and requires 'allow_delete' to be true or the call returns status 'DENIED'; a hunk whose "
+            "old-line/new-line counts in the '@@' header do not match the actual number of context/removed/added "
+            "lines is rejected as a 'Malformed unified diff' ERROR before anything is applied."
+        ),
+        {
+            "patch_text": {
+                "type": "string",
+                "description": "One or more concatenated unified-diff file entries (git 'diff --git' preambles are optional and ignored; only the '---'/'+++' headers and '@@' hunks are required). See the tool description for the exact format and examples.",
+            },
+            "directory": {
+                "type": "string",
+                "default": ".",
+                "description": "Base directory that the paths inside the patch headers are resolved relative to. Defaults to the current workspace root.",
+            },
+            "allow_delete": {
+                "type": "boolean",
+                "default": True,
+                "description": "If false, any hunk that deletes a file (target '/dev/null') causes the whole call to be refused with status 'DENIED' instead of applied.",
+            },
+        },
+        ["patch_text"],
+    ),
     _func_schema("get_file_digest", "Returns a cryptographic hash (default sha256) of a file's contents for change verification.", {"file_path": {"type": "string"}, "algorithm": {"type": "string", "default": "sha256"}}, ["file_path"]),
     _func_schema("delete_file", "Deletes a target file if it exists.", {"file_path": {"type": "string"}}, ["file_path"]),
     _func_schema("list_files", "Lists files in a target directory.", {"directory": {"type": "string", "default": "."}, "recursive": {"type": "boolean", "default": False}, "include_dirs": {"type": "boolean", "default": False}, "pattern": {"type": "string"}}, []),

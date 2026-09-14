@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agent-workspace-tools"
-version = "0.2.1"
+version = "0.2.2"
 description = "Unified file system, shell execution, and async background task tools for autonomous AI agents."
 readme = "README.md"
 requires-python = ">=3.10"

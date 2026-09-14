@@ -64,6 +64,32 @@ def test_tool_dispatcher_mapping():
         assert callable(FILE_TOOL_DISPATCHER[name])
 
 # ---------------------------------------------------------------------
+# Claude-optimized schema descriptions (write_file / replace_in_file / apply_patch)
+# ---------------------------------------------------------------------
+
+CLAUDE_OPTIMIZED_TOOLS = {"write_file", "replace_in_file", "apply_patch"}
+
+def test_claude_optimized_schemas_are_richly_documented():
+    by_name = {t["function"]["name"]: t["function"] for t in FILE_TOOLS_SCHEMA}
+    for name in CLAUDE_OPTIMIZED_TOOLS:
+        func = by_name[name]
+        desc = func["description"]
+        # Long, highly-detailed instructions (not a one-liner).
+        assert len(desc) > 500, f"{name} description should be richly detailed"
+        # Must include a concrete JSON payload example per the task spec.
+        assert '"name": "%s"' % name in desc
+        assert '"arguments"' in desc
+        # Every property should carry its own description for clarity.
+        for prop_name, prop_schema in func["parameters"]["properties"].items():
+            assert "description" in prop_schema, f"{name}.{prop_name} missing description"
+
+def test_modify_file_schema_documents_alias_routing():
+    by_name = {t["function"]["name"]: t["function"] for t in FILE_TOOLS_SCHEMA}
+    desc = by_name["modify_file"]["description"]
+    assert "replace_in_file" in desc
+    assert "write_file" in desc
+
+# ---------------------------------------------------------------------
 # Path normalization & sandbox
 # ---------------------------------------------------------------------
 
@@ -206,6 +232,41 @@ def test_replace_in_file_single_occurrence(tmp_path):
 def test_replace_in_file_missing_file(tmp_path):
     res = replace_in_file(str(tmp_path / "absent.txt"), "a", "b")
     assert res["status"] == "ERROR"
+
+# ---------------------------------------------------------------------
+# replace_in_file: whitespace/indentation-tolerant fuzzy fallback
+# ---------------------------------------------------------------------
+
+def test_replace_in_file_fuzzy_matches_indentation_drift(tmp_path):
+    test_file = str(tmp_path / "fuzzy_indent.py")
+    write_file(test_file, "def greet():\n        return 'hi'\n")
+
+    # Model reproduces the block with different (wrong) indentation.
+    res = replace_in_file(
+        test_file,
+        "def greet():\n    return 'hi'\n",
+        "def greet():\n    return 'hello'\n",
+    )
+    assert res["status"] == "SUCCESS"
+    assert res.get("fuzzy_matched") is True
+    assert "hello" in read_file(test_file)["content"]
+
+def test_replace_in_file_fuzzy_matches_extra_internal_whitespace(tmp_path):
+    test_file = str(tmp_path / "fuzzy_ws.py")
+    write_file(test_file, "x = 1  +   2\n")
+
+    res = replace_in_file(test_file, "x = 1 + 2\n", "x = 3\n")
+    assert res["status"] == "SUCCESS"
+    assert res.get("fuzzy_matched") is True
+    assert read_file(test_file)["content"] == "x = 3\n"
+
+def test_replace_in_file_fuzzy_fallback_still_fails_on_real_mismatch(tmp_path):
+    test_file = str(tmp_path / "fuzzy_fail.py")
+    write_file(test_file, "def greet():\n    return 'hi'\n")
+
+    res = replace_in_file(test_file, "def farewell():\n    return 'bye'\n", "x")
+    assert res["status"] == "ERROR"
+    assert "fuzzy match attempt" in res["error"]
 
 def test_delete_file(tmp_path):
     test_file = str(tmp_path / "temp.txt")
