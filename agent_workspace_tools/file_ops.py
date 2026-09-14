@@ -20,6 +20,148 @@ DEFAULT_MAX_READ_BYTES: int = int(
     os.environ.get("AGENT_FILE_TOOLS_MAX_READ_BYTES", "1000000")
 )
 
+
+# ---------------------------------------------------------------------
+# Hallucination-tolerant alias & argument sanitization
+# ---------------------------------------------------------------------
+# Models (Cline, local LLMs) frequently hallucinate `modify_file` or send
+# generic keys (`content`, `body`, `code`, `old_string`, ...) instead of the
+# exact `search_text` / `replace_text` / `code_body` keys. These maps heal
+# such mismatches in 0ms CPU time instead of tripping the circuit breaker.
+
+FILE_PATH_ALIASES = ("path", "filepath", "file", "relative_path", "filename", "target_file")
+
+# search_text aliases for replace-style edits
+SEARCH_TEXT_ALIASES = (
+    "search",
+    "search_string",
+    "old_text",
+    "old_string",
+    "old_content",
+    "find_text",
+    "find",
+    "original_text",
+    "original",
+)
+
+# replace_text aliases for replace-style edits
+REPLACE_TEXT_ALIASES = (
+    "replace",
+    "replacement",
+    "replacement_text",
+    "new_text",
+    "new_string",
+    "new_content",
+    # generic payload keys — only mapped when the canonical key is absent
+    # AND the call is a replace-style edit (search present or tool is
+    # replace_in_file / modify_file / regex_replace_in_file).
+    "content",
+    "body",
+    "code",
+    "code_body",
+    "text",
+    "file_content",
+    "data",
+)
+
+# code_body aliases for full-file writes
+CODE_BODY_ALIASES = (
+    "code",
+    "content",
+    "body",
+    "text",
+    "new_text",
+    "file_content",
+    "data",
+    "replace_text",
+    "new_string",
+    "new_content",
+)
+
+# Canonical tool aliases: hallucinated name -> canonical tool.
+# `modify_file` is resolved dynamically (replace vs write) by `modify_file()`;
+# the map entry documents the default route for introspection/helpers.
+TOOL_ALIASES: Dict[str, str] = {
+    "modify_file": "replace_in_file",
+    "edit_file": "replace_in_file",
+    "update_file": "replace_in_file",
+    "patch_file": "apply_patch",
+}
+
+
+def resolve_tool_alias(tool_name: str) -> str:
+    """Maps a hallucinated/alias tool name to its canonical tool name."""
+    return TOOL_ALIASES.get(tool_name, tool_name)
+
+
+def _pop_first_present(data: Dict[str, Any], names: Tuple[str, ...]) -> Any:
+    """Pops and returns the first present alias value, or None."""
+    for name in names:
+        if name in data and data[name] is not None:
+            return data.pop(name)
+    return None
+
+
+def sanitize_tool_kwargs(tool_name: str, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Heals minor schema mismatches by mapping alias keys to canonical keys.
+
+    - Never overwrites an explicitly provided canonical key.
+    - `file_path` aliases apply to every file tool.
+    - `search_text` / `replace_text` aliases apply to replace-style tools.
+    - `code_body` aliases apply to `write_file`.
+    - `content` / `body` / `code` map to `replace_text` when a search key is
+      present (replace intent), otherwise to `code_body` for write intent.
+    """
+    if not isinstance(kwargs, dict):
+        return kwargs
+    data = dict(kwargs)
+    canonical = resolve_tool_alias(tool_name)
+
+    # file_path aliases (all file tools)
+    if "file_path" not in data:
+        found = _pop_first_present(data, FILE_PATH_ALIASES)
+        if found is not None:
+            data["file_path"] = found
+
+    if canonical in ("replace_in_file", "modify_file"):
+        if "search_text" not in data:
+            found = _pop_first_present(data, SEARCH_TEXT_ALIASES)
+            if found is not None:
+                data["search_text"] = found
+        if "replace_text" not in data:
+            found = _pop_first_present(data, REPLACE_TEXT_ALIASES)
+            if found is not None:
+                data["replace_text"] = found
+    elif canonical == "write_file":
+        if "code_body" not in data:
+            found = _pop_first_present(data, CODE_BODY_ALIASES)
+            if found is not None:
+                data["code_body"] = found
+    elif canonical == "regex_replace_in_file":
+        if "pattern" not in data:
+            found = _pop_first_present(
+                data, SEARCH_TEXT_ALIASES + ("search_text", "search", "regex", "find_text")
+            )
+            if found is not None:
+                data["pattern"] = found
+        if "replace_text" not in data:
+            found = _pop_first_present(data, REPLACE_TEXT_ALIASES)
+            if found is not None:
+                data["replace_text"] = found
+    elif canonical == "append_to_file":
+        if "content" not in data:
+            found = _pop_first_present(data, CODE_BODY_ALIASES + ("replace_text",))
+            if found is not None:
+                data["content"] = found
+    elif canonical == "insert_lines":
+        if "new_text" not in data:
+            found = _pop_first_present(data, CODE_BODY_ALIASES + ("replace_text", "content"))
+            if found is not None:
+                data["new_text"] = found
+
+    return data
+
+
 SKIP_DIRS: Set[str] = {
     ".git", ".hg", ".svn", "__pycache__", ".venv", "venv", "node_modules",
     "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
@@ -87,8 +229,33 @@ def read_file(
 
 @track_latency
 @audit_logger(log_file="file_tools_telemetry.jsonl")
-def write_file(file_path: str, code_body: str, overwrite: bool = True) -> Dict[str, Any]:
+def write_file(
+    file_path: str,
+    code_body: Optional[str] = None,
+    overwrite: bool = True,
+    **kwargs: Any,
+) -> Dict[str, Any]:
     try:
+        # --- Hallucination-tolerant kwargs healing (never overrides explicit args) ---
+        if code_body is None:
+            healed = sanitize_tool_kwargs("write_file", {"file_path": file_path, **kwargs})
+            code_body = healed.get("code_body")
+            if "file_path" in healed:
+                file_path = healed["file_path"]
+        elif kwargs:
+            healed = sanitize_tool_kwargs(
+                "write_file", {"file_path": file_path, "code_body": code_body, **kwargs}
+            )
+            file_path = healed.get("file_path", file_path)
+            code_body = healed.get("code_body", code_body)
+            if isinstance(healed.get("overwrite"), bool):
+                overwrite = healed["overwrite"]
+        if code_body is None:
+            return {
+                "file_path": file_path,
+                "error": "code_body: Field required. Provide full file content to write.",
+                "status": "ERROR",
+            }
         posix_path = normalize_path(file_path)
         path_obj = Path(posix_path)
 
@@ -116,11 +283,37 @@ def write_file(file_path: str, code_body: str, overwrite: bool = True) -> Dict[s
 @audit_logger(log_file="file_tools_telemetry.jsonl")
 def replace_in_file(
     file_path: str,
-    search_text: str,
-    replace_text: str,
+    search_text: Optional[str] = None,
+    replace_text: Optional[str] = None,
     replace_all: bool = True,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     try:
+        # --- Hallucination-tolerant kwargs healing (never overrides explicit args) ---
+        _explicit = {
+            "file_path": file_path,
+            **({"search_text": search_text} if search_text is not None else {}),
+            **({"replace_text": replace_text} if replace_text is not None else {}),
+            **kwargs,
+        }
+        healed = sanitize_tool_kwargs("replace_in_file", _explicit)
+        file_path = healed.get("file_path", file_path)
+        search_text = healed.get("search_text", search_text)
+        replace_text = healed.get("replace_text", replace_text)
+        if isinstance(healed.get("replace_all"), bool):
+            replace_all = healed["replace_all"]
+        if search_text is None:
+            return {
+                "file_path": file_path,
+                "error": "search_text: Field required. Provide the exact text block to find.",
+                "status": "ERROR",
+            }
+        if replace_text is None:
+            return {
+                "file_path": file_path,
+                "error": "replace_text: Field required. Provide the replacement text.",
+                "status": "ERROR",
+            }
         posix_path = normalize_path(file_path)
         path_obj = Path(posix_path)
 
@@ -155,6 +348,55 @@ def replace_in_file(
         }
     except Exception as e:
         return {"file_path": file_path, "error": str(e), "status": "ERROR"}
+
+
+@track_latency
+@audit_logger(log_file="file_tools_telemetry.jsonl")
+def modify_file(file_path: str, **kwargs: Any) -> Dict[str, Any]:
+    """Hallucination-tolerant alias dispatcher.
+
+    Models frequently emit `modify_file` instead of `replace_in_file` /
+    `write_file`. This dispatcher heals argument aliases and routes by
+    payload structure:
+
+    - search-like payload (``search_text`` or aliases such as ``old_string``,
+      ``search``, ``find``) -> :func:`replace_in_file`
+    - content-only payload (``replace_text`` / ``content`` / ``body`` /
+      ``code`` / ``code_body`` without any search key) -> :func:`write_file`
+      (full-file overwrite; creates the file when missing).
+    """
+    healed = sanitize_tool_kwargs("modify_file", {"file_path": file_path, **kwargs})
+    target = healed.get("file_path", file_path)
+    has_search = ("search_text" in healed and healed["search_text"] is not None)
+
+    if has_search:
+        result = replace_in_file(
+            target,
+            healed.get("search_text"),
+            healed.get("replace_text"),
+            healed.get("replace_all", True),
+        )
+        routed_to = "replace_in_file"
+    else:
+        replacement = healed.get("replace_text")
+        if replacement is None:
+            return {
+                "file_path": target,
+                "error": (
+                    "search_text: Field required. Provide the exact text block to find, "
+                    "or provide full replacement content (content/body/code) to overwrite the file."
+                ),
+                "status": "ERROR",
+                "routed_via": "modify_file",
+            }
+        result = write_file(target, replacement, overwrite=True)
+        routed_to = "write_file"
+
+    if isinstance(result, dict):
+        result = dict(result)
+        result.setdefault("routed_via", f"modify_file->{routed_to}")
+        result.setdefault("tool", "modify_file")
+    return result
 
 
 @track_latency
@@ -357,11 +599,22 @@ def move_file(source_path: str, destination_path: str, overwrite: bool = False) 
 def insert_lines(
     file_path: str,
     insert_line: int,
-    new_text: str,
+    new_text: Optional[str] = None,
     create_if_missing: bool = False,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Inserts `new_text` at a 1-based line boundary without disturbing surrounding lines."""
     try:
+        healed = sanitize_tool_kwargs(
+            "insert_lines", {"file_path": file_path, "insert_line": insert_line, **({"new_text": new_text} if new_text is not None else {}), **kwargs}
+        )
+        file_path = healed.get("file_path", file_path)
+        insert_line = healed.get("insert_line", insert_line)
+        new_text = healed.get("new_text", new_text)
+        if isinstance(healed.get("create_if_missing"), bool):
+            create_if_missing = healed["create_if_missing"]
+        if new_text is None:
+            return {"file_path": file_path, "error": "new_text: Field required.", "status": "ERROR"}
         posix_path = normalize_path(file_path)
         path_obj = Path(posix_path)
 
@@ -409,11 +662,21 @@ def insert_lines(
 @audit_logger(log_file="file_tools_telemetry.jsonl")
 def append_to_file(
     file_path: str,
-    content: str,
+    content: Optional[str] = None,
     ensure_newline: bool = True,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Appends `content` to the end of a file, creating the file when it does not exist."""
     try:
+        healed = sanitize_tool_kwargs(
+            "append_to_file", {"file_path": file_path, **({"content": content} if content is not None else {}), **kwargs}
+        )
+        file_path = healed.get("file_path", file_path)
+        content = healed.get("content", content)
+        if isinstance(healed.get("ensure_newline"), bool):
+            ensure_newline = healed["ensure_newline"]
+        if content is None:
+            return {"file_path": file_path, "error": "content: Field required.", "status": "ERROR"}
         posix_path = normalize_path(file_path)
         path_obj = Path(posix_path)
 
@@ -448,13 +711,31 @@ def append_to_file(
 @audit_logger(log_file="file_tools_telemetry.jsonl")
 def regex_replace_in_file(
     file_path: str,
-    pattern: str,
-    replace_text: str,
+    pattern: Optional[str] = None,
+    replace_text: Optional[str] = None,
     count: int = 0,
     case_sensitive: bool = True,
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """Regex find & replace, best for refactors where matches vary in whitespace/casing."""
     try:
+        _explicit: Dict[str, Any] = {"file_path": file_path, **kwargs}
+        if pattern is not None:
+            _explicit["pattern"] = pattern
+        if replace_text is not None:
+            _explicit["replace_text"] = replace_text
+        healed = sanitize_tool_kwargs("regex_replace_in_file", _explicit)
+        file_path = healed.get("file_path", file_path)
+        pattern = healed.get("pattern", pattern)
+        replace_text = healed.get("replace_text", replace_text)
+        if "count" in healed:
+            count = healed["count"]
+        if "case_sensitive" in healed:
+            case_sensitive = healed["case_sensitive"]
+        if pattern is None:
+            return {"file_path": file_path, "error": "pattern: Field required.", "status": "ERROR"}
+        if replace_text is None:
+            return {"file_path": file_path, "error": "replace_text: Field required.", "status": "ERROR"}
         posix_path = normalize_path(file_path)
         path_obj = Path(posix_path)
 
@@ -754,6 +1035,7 @@ FILE_TOOLS_SCHEMA: List[Dict[str, Any]] = [
     _func_schema("read_file", "Reads text content from a specified file.", {"file_path": {"type": "string"}, "start_line": {"type": "integer"}, "end_line": {"type": "integer"}}, ["file_path"]),
     _func_schema("write_file", "Writes content to a file, atomically. Overwrites ENTIRE file. Use replace_in_file for edits.", {"file_path": {"type": "string"}, "code_body": {"type": "string"}, "overwrite": {"type": "boolean", "default": True}}, ["file_path", "code_body"]),
     _func_schema("replace_in_file", "Replaces an exact text block in a file with new text. ALWAYS use this instead of write_file for edits.", {"file_path": {"type": "string"}, "search_text": {"type": "string"}, "replace_text": {"type": "string"}, "replace_all": {"type": "boolean", "default": True}}, ["file_path", "search_text", "replace_text"]),
+    _func_schema("modify_file", "Alias for surgical file edits. Routes to replace_in_file when search_text (or aliases like old_string/search/content pairing) is present, else overwrites the file like write_file when only replacement content (content/body/code/code_body) is given. Prefer replace_in_file for exact edits.", {"file_path": {"type": "string"}, "search_text": {"type": "string"}, "replace_text": {"type": "string"}, "replace_all": {"type": "boolean", "default": True}}, ["file_path"]),
     _func_schema("insert_lines", "Inserts new text at an exact 1-based line boundary without rewriting surrounding content. Use to add imports, functions, or config entries precisely.", {"file_path": {"type": "string"}, "insert_line": {"type": "integer"}, "new_text": {"type": "string"}, "create_if_missing": {"type": "boolean", "default": False}}, ["file_path", "insert_line", "new_text"]),
     _func_schema("append_to_file", "Appends content to the end of a file, creating the file when it does not exist.", {"file_path": {"type": "string"}, "content": {"type": "string"}, "ensure_newline": {"type": "boolean", "default": True}}, ["file_path", "content"]),
     _func_schema("regex_replace_in_file", "Performs a regex find-and-replace in a file. Prefer over replace_in_file for refactors where matches vary in whitespace or casing.", {"file_path": {"type": "string"}, "pattern": {"type": "string"}, "replace_text": {"type": "string"}, "count": {"type": "integer", "default": 0}, "case_sensitive": {"type": "boolean", "default": True}}, ["file_path", "pattern", "replace_text"]),
@@ -772,6 +1054,9 @@ FILE_TOOL_DISPATCHER: Dict[str, Any] = {
     "read_file": read_file,
     "write_file": write_file,
     "replace_in_file": replace_in_file,
+    "modify_file": modify_file,
+    "edit_file": replace_in_file,
+    "update_file": replace_in_file,
     "insert_lines": insert_lines,
     "append_to_file": append_to_file,
     "regex_replace_in_file": regex_replace_in_file,
@@ -785,3 +1070,9 @@ FILE_TOOL_DISPATCHER: Dict[str, Any] = {
     "copy_file": copy_file,
     "move_file": move_file,
 }
+
+
+# Backwards-compatible alias entry points (direct function references so
+# `WORKSPACE_TOOL_DISPATCHER["edit_file"] is replace_in_file` holds).
+edit_file = replace_in_file
+update_file = replace_in_file

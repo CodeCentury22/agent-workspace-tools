@@ -40,16 +40,26 @@ EXPECTED_TOOL_NAMES = {
     "move_file",
 }
 
+# Hallucinated/alias tool names that must route transparently (dispatcher-only).
+EXPECTED_ALIAS_TOOL_NAMES = {
+    "modify_file",
+    "edit_file",
+    "update_file",
+}
+
 # ---------------------------------------------------------------------
 # Registry consistency
 # ---------------------------------------------------------------------
 
 def test_file_tools_schema_structure():
     tool_names = {t["function"]["name"] for t in FILE_TOOLS_SCHEMA}
-    assert tool_names == EXPECTED_TOOL_NAMES
+    # Canonical tools must all be advertised; modify_file alias is also advertised.
+    assert EXPECTED_TOOL_NAMES <= tool_names
+    assert "modify_file" in tool_names
 
 def test_tool_dispatcher_mapping():
-    assert set(FILE_TOOL_DISPATCHER) == EXPECTED_TOOL_NAMES
+    assert EXPECTED_TOOL_NAMES <= set(FILE_TOOL_DISPATCHER)
+    assert EXPECTED_ALIAS_TOOL_NAMES <= set(FILE_TOOL_DISPATCHER)
     for name in FILE_TOOL_DISPATCHER:
         assert callable(FILE_TOOL_DISPATCHER[name])
 

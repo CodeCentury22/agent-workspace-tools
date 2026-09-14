@@ -26,14 +26,14 @@ never shell out or edit files directly — it routes through `WORKSPACE_TOOLS_SC
 ## Installation
 
 ```bash
-uv add "agent-workspace-tools @ git+https://github.com/CodeCentury22/agent-workspace-tools.git@v0.2.0"
+uv add "agent-workspace-tools @ git+https://github.com/CodeCentury22/agent-workspace-tools.git@v0.2.1"
 ```
 
 Or via `pyproject.toml`:
 
 ```toml
 [tool.uv.sources]
-agent-workspace-tools = { git = "https://github.com/CodeCentury22/agent-workspace-tools.git", tag = "v0.2.0" }
+agent-workspace-tools = { git = "https://github.com/CodeCentury22/agent-workspace-tools.git", tag = "v0.2.1" }
 ```
 
 ## Tool Inventory
